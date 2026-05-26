@@ -1,0 +1,271 @@
+[suite]
+queries_file = "queries.sql"
+output_dir = "results/local"
+profiling_mode = "json"
+warm_runs = 3
+cold_runs = 2
+
+setup_sql = [
+  "SET parquet_metadata_cache=true",
+  "LOAD httpfs",
+  "LOAD iceberg",
+  "CREATE OR REPLACE MACRO toDateTime(t) AS CASE WHEN starts_with(typeof(t), 'TIMESTAMP') THEN CAST(t AS TIMESTAMP) ELSE epoch_ms(CAST(t AS BIGINT) * 1000) END",
+]
+
+[suite.s3]
+access_key_id = "replace-me"
+secret_access_key = "replace-me"
+region = "us-east-1"
+# session_token = "replace-me"
+# endpoint = "http://localhost:9000"
+# url_style = "path"
+# use_ssl = false
+
+[[engines]]
+name = "duckdb"
+backend = "duckdb"
+binary = "duckdb"
+database = ":memory:"
+table_name = "hits"
+env = { SAMPLE_ENGINE_ENV = "replace-me" }
+
+# ── Sirius (cold): GPU path, no preload ──────────────────────────────────────
+# Binary path relative to runner.toml location.  On BSC, copy to node-local
+# tmp first and point binary there to avoid GPFS hangs.
+#[[engines]]
+#name = "sirius-cold"
+#backend = "duckdb"
+#query_execution_mode = "gpu-execution"
+#binary = "../../../sirius/build/release/duckdb/bin/sirius-duckdb"
+#database = ":memory:"
+#table_name = "hits"
+#setup_sql = [
+#  "CALL gpu_buffer_init('0.5 GB', '6 GB')",
+#  "LOAD sirius",
+#]
+
+# ── Sirius (hot): GPU path with preload to warm the buffer manager ────────────
+# preload_sql runs after the table view is created and before the measured
+# warm-run loop.  First pass loads data into the GPU cache; subsequent queries
+# in the same process find it warm.
+# No explicit pin_table primitive exists in Sirius; the buffer manager retains
+# data in GPU memory for the lifetime of the process automatically.
+#[[engines]]
+#name = "sirius-hot"
+#backend = "duckdb"
+#query_execution_mode = "gpu-execution"
+#binary = "../../../sirius/build/release/duckdb/bin/sirius-duckdb"
+#database = ":memory:"
+#table_name = "hits"
+#setup_sql = [
+#  "CALL gpu_buffer_init('0.5 GB', '6 GB')",
+#  "LOAD sirius",
+#  # Materialise into a real table so the buffer manager can cache it:
+#  "CREATE TABLE hits_mat AS SELECT * FROM hits",
+#  "CREATE OR REPLACE VIEW hits AS SELECT * FROM hits_mat",
+#]
+#preload_sql = [
+#  # Warming query: touches real columns from the most common query patterns.
+#  # Wrap in gpu_execution so the GPU buffer manager actually loads the data.
+#  """CALL gpu_execution('SELECT count(*), min(EventTime), max(EventTime),
+#       min(EventDate), max(EventDate),
+#       min(CounterID), max(CounterID),
+#       min(UserID), max(UserID)
+#     FROM hits')""",
+#]
+
+[[engines]]
+name = "polars-cpu"
+backend = "polars"
+binary = "python3"
+args = ["-u"]
+table_name = "hits"
+polars_collect_engine = "auto"
+env = { POLARS_VERBOSE = "1" }
+
+# ── Polars GPU (cold): GPU engine, no preload ─────────────────────────────────
+# raise_on_fail is derived from polars_collect_engine = "gpu" automatically.
+#[[engines]]
+#name = "polars-gpu-cold"
+#backend = "polars"
+#binary = "/gpfs/scratch/qbst01/lakebench/src/sirius/.pixi/envs/cuda12/bin/python"
+#args = ["-u"]
+#table_name = "hits"
+#polars_collect_engine = "gpu"
+#env = { POLARS_VERBOSE = "1" }
+
+# ── Polars GPU (hot): one extra warmup collect before measured loop ───────────
+# polars_preload = "warmup" runs one throwaway .collect(engine=gpu) before the
+# measured iterations, warming the GPU page cache and cuDF allocator.
+# All measured warm_runs then see a warm GPU — they are all labelled Warm.
+#[[engines]]
+#name = "polars-gpu-hot"
+#backend = "polars"
+#binary = "/gpfs/scratch/qbst01/lakebench/src/sirius/.pixi/envs/cuda12/bin/python"
+#args = ["-u"]
+#table_name = "hits"
+#polars_collect_engine = "gpu"
+#polars_preload = "warmup"
+#env = { POLARS_VERBOSE = "1" }
+
+[[datasets]]
+name = "parquet-eventdate-part"
+table_sql = "SELECT * REPLACE (make_date(EventDate) AS EventDate) FROM iceberg_scan('s3://qb-testing/spieg/clickbench/iceberg_eventdate_part_phy/metadata/00001-d39f0ae4-282a-46d0-972b-0541f03b08b0.metadata.json')"
+polars_format = "parquet"
+polars_source = "s3://qb-testing/spieg/clickbench/iceberg_eventdate_part_phy/data/**/*.parquet"
+#sample = { target_bytes = "2GiB", probe_rows = 100000, overhead_multiplier = 3.0 }
+#sample = { rows = 20000 }
+
+[[datasets]]
+name = "delta-qbeast-advanced-pca"
+table_sql = "SELECT * REPLACE (make_date(EventDate) AS EventDate) FROM delta_scan('s3://qb-testing/deepam/clickbench/qbeast-spark4-mrcpf800000-CounterID-UserID-delta-advancedpca-final/')"
+polars_format = "delta"
+polars_source = "s3://qb-testing/deepam/clickbench/qbeast-spark4-mrcpf800000-CounterID-UserID-delta-advancedpca-final/"
+#sample = { target_bytes = "2GiB", probe_rows = 100000, overhead_multiplier = 3.0 }
+#sample = { rows = 20000 }
+
+[[datasets]]
+name = "delta-eventdate-part"
+table_sql = "SELECT * REPLACE (make_date(EventDate) AS EventDate) FROM delta_scan('s3://qb-testing/spieg/clickbench/delta_eventdate_part_opt2/')"
+polars_format = "delta"
+polars_source = "s3://qb-testing/spieg/clickbench/delta_eventdate_part_opt2/"
+#sample = { target_bytes = "2GiB", probe_rows = 100000, overhead_multiplier = 3.0 }
+#sample = { rows = 20000 }
+
+[[datasets]]
+name = "iceberg-eventdate-part"
+table_sql = "SELECT * REPLACE (make_date(EventDate) AS EventDate) FROM iceberg_scan('s3://qb-testing/spieg/clickbench/iceberg_eventdate_part_phy/metadata/00001-d39f0ae4-282a-46d0-972b-0541f03b08b0.metadata.json')"
+polars_format = "iceberg"
+polars_source = "s3://qb-testing/spieg/clickbench/iceberg_eventdate_part_phy/metadata/00001-d39f0ae4-282a-46d0-972b-0541f03b08b0.metadata.json"
+#sample = { target_bytes = "2GiB", probe_rows = 100000, overhead_multiplier = 3.0 }
+#sample = { rows = 20000 }
+
+[[datasets]]
+name = "iceberg-qbeast-2colquant"
+table_sql = "SELECT * REPLACE (make_date(EventDate) AS EventDate) FROM iceberg_scan('s3://qb-testing/spieg/clickbench/qbeast_iceberg_750k_eventdate_part_2colquant_phy_opt/metadata/00005-c67569db-74f7-4cd3-9f9f-276e655d418c.metadata.json')"
+polars_format = "iceberg"
+polars_source = "s3://qb-testing/spieg/clickbench/qbeast_iceberg_750k_eventdate_part_2colquant_phy_opt/metadata/00005-c67569db-74f7-4cd3-9f9f-276e655d418c.metadata.json"
+#sample = { target_bytes = "2GiB", probe_rows = 100000, overhead_multiplier = 3.0 }
+#sample = { rows = 20000 }
+
+[[scenarios]]
+name = "duckdb-delta_raw"
+engine = "duckdb"
+dataset = "delta_raw"
+tags = ["duckdb", "delta"]
+
+[[scenarios]]
+name = "siriusdb-delta_raw"
+engine = "siriusdb"
+dataset = "delta_raw"
+tags = ["siriusdb", "delta", "gpu"]
+
+[[scenarios]]
+name = "polars-cpu-delta_raw"
+engine = "polars-cpu"
+dataset = "delta_raw"
+tags = ["polars", "delta", "cpu"]
+
+[[scenarios]]
+name = "polars-gpu-delta_raw"
+engine = "polars-gpu"
+dataset = "delta_raw"
+tags = ["polars", "delta", "gpu"]
+
+[[scenarios]]
+name = "duckdb-delta-eventdate-part"
+engine = "duckdb"
+dataset = "delta-eventdate-part"
+tags = ["duckdb", "delta", "partition"]
+
+[[scenarios]]
+name = "siriusdb-delta-eventdate-part"
+engine = "siriusdb"
+dataset = "delta-eventdate-part"
+tags = ["siriusdb", "delta", "partition", "gpu"]
+
+[[scenarios]]
+name = "polars-cpu-delta-eventdate-part"
+engine = "polars-cpu"
+dataset = "delta-eventdate-part"
+tags = ["polars", "delta", "partition", "cpu"]
+
+[[scenarios]]
+name = "polars-gpu-delta-eventdate-part"
+engine = "polars-gpu"
+dataset = "delta-eventdate-part"
+tags = ["polars", "delta", "partition", "gpu"]
+
+[[scenarios]]
+name = "duckdb-delta-qbeast"
+engine = "duckdb"
+dataset = "delta-qbeast"
+tags = ["duckdb", "delta", "qbeast"]
+
+[[scenarios]]
+name = "siriusdb-delta-qbeast"
+engine = "siriusdb"
+dataset = "delta-qbeast"
+tags = ["siriusdb", "delta", "qbeast", "gpu"]
+
+[[scenarios]]
+name = "polars-cpu-delta-qbeast"
+engine = "polars-cpu"
+dataset = "delta-qbeast"
+tags = ["polars", "delta", "qbeast", "cpu"]
+
+[[scenarios]]
+name = "polars-gpu-delta-qbeast"
+engine = "polars-gpu"
+dataset = "delta-qbeast"
+tags = ["polars", "delta", "qbeast", "gpu"]
+
+# ── GPU hot/cold scenarios (uncomment matching engines above first) ────────────
+
+#[[scenarios]]
+#name = "sirius-cold-parquet-eventdate-part"
+#engine = "sirius-cold"
+#dataset = "parquet-eventdate-part"
+#tags = ["sirius", "parquet", "partition", "gpu", "cold"]
+
+#[[scenarios]]
+#name = "sirius-hot-parquet-eventdate-part"
+#engine = "sirius-hot"
+#dataset = "parquet-eventdate-part"
+#tags = ["sirius", "parquet", "partition", "gpu", "hot"]
+
+#[[scenarios]]
+#name = "polars-gpu-cold-parquet-eventdate-part"
+#engine = "polars-gpu-cold"
+#dataset = "parquet-eventdate-part"
+#tags = ["polars", "parquet", "partition", "gpu", "cold"]
+
+#[[scenarios]]
+#name = "polars-gpu-hot-parquet-eventdate-part"
+#engine = "polars-gpu-hot"
+#dataset = "parquet-eventdate-part"
+#tags = ["polars", "parquet", "partition", "gpu", "hot"]
+
+#[[scenarios]]
+#name = "sirius-cold-delta-eventdate-part"
+#engine = "sirius-cold"
+#dataset = "delta-eventdate-part"
+#tags = ["sirius", "delta", "partition", "gpu", "cold"]
+
+#[[scenarios]]
+#name = "sirius-hot-delta-eventdate-part"
+#engine = "sirius-hot"
+#dataset = "delta-eventdate-part"
+#tags = ["sirius", "delta", "partition", "gpu", "hot"]
+
+#[[scenarios]]
+#name = "polars-gpu-cold-delta-eventdate-part"
+#engine = "polars-gpu-cold"
+#dataset = "delta-eventdate-part"
+#tags = ["polars", "delta", "partition", "gpu", "cold"]
+
+#[[scenarios]]
+#name = "polars-gpu-hot-delta-eventdate-part"
+#engine = "polars-gpu-hot"
+#dataset = "delta-eventdate-part"
+#tags = ["polars", "delta", "partition", "gpu", "hot"]

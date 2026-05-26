@@ -1,0 +1,6 @@
+polars
+pyiceberg
+pyarrow
+boto3
+s3fs
+deltalake
